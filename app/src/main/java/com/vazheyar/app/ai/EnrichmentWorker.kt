@@ -23,11 +23,15 @@ class EnrichmentWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val dao = AppDatabase.get(applicationContext).flashcards()
         val pending = dao.pending(limit = 20)
+
         if (pending.isEmpty()) return@withContext Result.success()
         if (!GeminiApiKeyStore.hasKey(applicationContext)) return@withContext Result.success()
 
         try {
-            val enriched = AiEnrichmentClient.enrich(applicationContext, pending.map { it.word })
+            val enriched = AiEnrichmentClient.enrich(
+                applicationContext,
+                pending.map { it.word }
+            )
             val byWord = enriched.associateBy { it.word.trim().lowercase() }
 
             pending.forEach { card ->
@@ -36,9 +40,9 @@ class EnrichmentWorker(
                     dao.update(
                         card.copy(
                             ipa = item.ipa,
-                            translationFa = item.translationFa,
+                            translationFa = item.meaningsFa.joinToString("\n") { "• $it" },
                             exampleEn = item.exampleEn,
-                            exampleFa = item.exampleFa,
+                            exampleFa = "",
                             enrichmentStatus = EnrichmentStatus.READY.name,
                             enrichmentError = null,
                             nextReviewAt = System.currentTimeMillis()
@@ -48,7 +52,7 @@ class EnrichmentWorker(
                     dao.update(
                         card.copy(
                             enrichmentStatus = EnrichmentStatus.FAILED.name,
-                            enrichmentError = "No AI result returned"
+                            enrichmentError = "No Gemini result was returned for this word."
                         )
                     )
                 }
@@ -57,21 +61,42 @@ class EnrichmentWorker(
             if (dao.pending(limit = 1).isNotEmpty()) {
                 EnrichmentScheduler.enqueue(applicationContext)
             }
+
             Result.success()
-        } catch (t: Throwable) {
-            if (runAttemptCount >= 4) {
-                pending.forEach { card ->
-                    dao.update(
-                        card.copy(
-                            enrichmentStatus = EnrichmentStatus.FAILED.name,
-                            enrichmentError = t.message?.take(300)
-                        )
-                    )
-                }
-                Result.failure()
-            } else {
+        } catch (e: GeminiApiException) {
+            val retryable = e.statusCode == 408 ||
+                e.statusCode == 409 ||
+                e.statusCode == 429 ||
+                e.statusCode >= 500
+
+            if (retryable && runAttemptCount < 2) {
                 Result.retry()
+            } else {
+                markFailed(pending, e.message ?: "Gemini request failed.")
+                Result.failure()
             }
+        } catch (t: Throwable) {
+            if (runAttemptCount < 2) {
+                Result.retry()
+            } else {
+                markFailed(
+                    pending,
+                    t.message?.take(500) ?: "Unexpected enrichment error."
+                )
+                Result.failure()
+            }
+        }
+    }
+
+    private suspend fun markFailed(cards: List<com.vazheyar.app.data.FlashcardEntity>, message: String) {
+        val dao = AppDatabase.get(applicationContext).flashcards()
+        cards.forEach { card ->
+            dao.update(
+                card.copy(
+                    enrichmentStatus = EnrichmentStatus.FAILED.name,
+                    enrichmentError = message.take(500)
+                )
+            )
         }
     }
 }
