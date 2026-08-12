@@ -11,26 +11,26 @@ import java.net.URL
 internal data class EnrichedCard(
     val word: String,
     val ipa: String,
-    val translationFa: String,
-    val exampleEn: String,
-    val exampleFa: String
+    val meaningsFa: List<String>,
+    val exampleEn: String
 )
+
+internal class GeminiApiException(
+    val statusCode: Int,
+    message: String
+) : Exception(message)
 
 internal object AiEnrichmentClient {
 
-    private const val MODEL = "gemini-2.5-flash"
-
+    private const val MODEL = "gemini-3.6-flash"
+    private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1/interactions"
     private const val CONNECT_TIMEOUT = 15_000
     private const val READ_TIMEOUT = 45_000
-
-    private val ENDPOINT =
-        "https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent"
 
     fun enrich(
         context: Context,
         words: List<String>
     ): List<EnrichedCard> {
-
         if (words.isEmpty()) return emptyList()
 
         val cleanWords = words
@@ -41,385 +41,218 @@ internal object AiEnrichmentClient {
         if (cleanWords.isEmpty()) return emptyList()
 
         val apiKey = GeminiApiKeyStore.load(context)
-            ?: error(
-                "کلید Google Gemini تنظیم نشده است. " +
-                    "آن را در بخش تنظیمات ذخیره کنید."
-            )
+            ?: error("Google Gemini API key is not configured. Add it in Settings.")
 
-        val connection =
-            (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = CONNECT_TIMEOUT
-                readTimeout = READ_TIMEOUT
-                doOutput = true
-
-                setRequestProperty(
-                    "Content-Type",
-                    "application/json; charset=utf-8"
-                )
-
-                setRequestProperty(
-                    "Accept",
-                    "application/json"
-                )
-
-                setRequestProperty(
-                    "x-goog-api-key",
-                    apiKey
-                )
-            }
+        val connection = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = CONNECT_TIMEOUT
+            readTimeout = READ_TIMEOUT
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("x-goog-api-key", apiKey)
+        }
 
         try {
             val requestBody = buildRequest(cleanWords).toString()
-
             connection.outputStream.use { output ->
-                output.write(
-                    requestBody.toByteArray(Charsets.UTF_8)
-                )
+                output.write(requestBody.toByteArray(Charsets.UTF_8))
             }
 
             val responseCode = connection.responseCode
+            val stream = if (responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
 
-            val stream =
-                if (responseCode in 200..299) {
-                    connection.inputStream
-                } else {
-                    connection.errorStream
+            val responseText = stream?.let {
+                BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { reader ->
+                    reader.readText()
                 }
-
-            val responseText =
-                stream?.let {
-                    BufferedReader(
-                        InputStreamReader(it, Charsets.UTF_8)
-                    ).use { reader ->
-                        reader.readText()
-                    }
-                }.orEmpty()
+            }.orEmpty()
 
             if (responseCode !in 200..299) {
+                val apiMessage = runCatching {
+                    JSONObject(responseText)
+                        .optJSONObject("error")
+                        ?.optString("message")
+                        ?.takeIf { it.isNotBlank() }
+                }.getOrNull()
 
-                val apiMessage =
-                    runCatching {
-                        JSONObject(responseText)
-                            .optJSONObject("error")
-                            ?.optString("message")
-                            ?.takeIf { it.isNotBlank() }
-                    }.getOrNull()
+                val friendlyMessage = when (responseCode) {
+                    400 -> "Gemini rejected the request as invalid."
+                    401, 403 -> "The Gemini API key is invalid or does not have access."
+                    404 -> "The selected Gemini model or API endpoint is unavailable."
+                    408 -> "The Gemini request timed out."
+                    429 -> "Gemini rate limit or quota was reached."
+                    in 500..599 -> "Gemini is temporarily unavailable."
+                    else -> "Gemini request failed with HTTP $responseCode."
+                }
 
-                val friendlyMessage =
-                    when (responseCode) {
-
-                        400 ->
-                            "درخواست Gemini نامعتبر بود."
-
-                        401, 403 ->
-                            "کلید Gemini معتبر نیست یا اجازه دسترسی ندارد."
-
-                        429 ->
-                            "سهمیه رایگان Gemini فعلاً تمام شده یا محدودیت درخواست فعال شده است."
-
-                        else ->
-                            "خطا در ارتباط با Gemini."
+                throw GeminiApiException(
+                    statusCode = responseCode,
+                    message = buildString {
+                        append(friendlyMessage)
+                        if (!apiMessage.isNullOrBlank()) {
+                            append(" ")
+                            append(apiMessage.take(500))
+                        }
                     }
-
-                error(
-                    "$friendlyMessage\n" +
-                        (apiMessage ?: "HTTP $responseCode")
                 )
             }
 
-            return parseResponse(
-                responseText = responseText,
-                expectedWords = cleanWords
-            )
-
+            return parseResponse(responseText, cleanWords)
         } finally {
             connection.disconnect()
         }
     }
 
-    private fun buildRequest(
-        words: List<String>
-    ): JSONObject {
-
-        val cardSchema =
-            JSONObject()
-                .put("type", "object")
-                .put(
-                    "properties",
-                    JSONObject()
-                        .put(
-                            "word",
-                            JSONObject()
-                                .put("type", "string")
-                        )
-                        .put(
-                            "ipa",
-                            JSONObject()
-                                .put("type", "string")
-                        )
-                        .put(
-                            "translationFa",
-                            JSONObject()
-                                .put("type", "string")
-                        )
-                        .put(
-                            "exampleEn",
-                            JSONObject()
-                                .put("type", "string")
-                        )
-                        .put(
-                            "exampleFa",
-                            JSONObject()
-                                .put("type", "string")
-                        )
-                )
-                .put(
-                    "required",
-                    JSONArray(
-                        listOf(
-                            "word",
-                            "ipa",
-                            "translationFa",
-                            "exampleEn",
-                            "exampleFa"
-                        )
+    private fun buildRequest(words: List<String>): JSONObject {
+        val cardSchema = JSONObject()
+            .put("type", "object")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("ipa", JSONObject().put("type", "string"))
+                    .put(
+                        "meaningsFa",
+                        JSONObject()
+                            .put("type", "array")
+                            .put("items", JSONObject().put("type", "string"))
+                            .put("minItems", 1)
+                            .put("maxItems", 4)
                     )
-                )
-                .put(
-                    "additionalProperties",
-                    false
-                )
+                    .put("exampleEn", JSONObject().put("type", "string"))
+            )
+            .put("required", JSONArray(listOf("ipa", "meaningsFa", "exampleEn")))
+            .put("additionalProperties", false)
 
-        val responseSchema =
-            JSONObject()
-                .put("type", "object")
-                .put(
-                    "properties",
+        val responseSchema = JSONObject()
+            .put("type", "object")
+            .put(
+                "properties",
+                JSONObject().put(
+                    "cards",
                     JSONObject()
-                        .put(
-                            "cards",
-                            JSONObject()
-                                .put("type", "array")
-                                .put("items", cardSchema)
-                                .put(
-                                    "minItems",
-                                    words.size
-                                )
-                                .put(
-                                    "maxItems",
-                                    words.size
-                                )
-                        )
+                        .put("type", "array")
+                        .put("items", cardSchema)
+                        .put("minItems", words.size)
+                        .put("maxItems", words.size)
                 )
-                .put(
-                    "required",
-                    JSONArray(
-                        listOf("cards")
-                    )
-                )
-                .put(
-                    "additionalProperties",
-                    false
-                )
+            )
+            .put("required", JSONArray(listOf("cards")))
+            .put("additionalProperties", false)
 
-        val prompt = """
-You are creating English-to-Persian vocabulary flashcards.
+        val systemInstruction = """
+You create accurate English-to-Persian vocabulary flashcards for language learners.
+Follow the requested JSON schema exactly. Keep answers concise and practical.
+Do not add explanations, markdown, notes, or fields that are not requested.
+        """.trimIndent()
 
-For every input word, create exactly one flashcard.
+        val input = """
+Create exactly one flashcard record for each English word below, in the exact same order.
 
-Important rules:
-
-1. Keep the cards in exactly the same order as the input words.
-
-2. "word":
-Return the original English word.
-
-3. "ipa":
-Return standard General American English IPA.
-Put the IPA between /slashes/.
-
-4. "translationFa":
-Return the most useful and natural Persian meaning.
-Keep it concise.
-If necessary, include at most two common meanings separated by «؛».
-
-5. "exampleEn":
-Write one short, natural English example sentence.
-The sentence must clearly demonstrate the target word.
-
-6. "exampleFa":
-Write a fluent Persian translation of exampleEn.
-
-7. Do not omit any input word.
-
-8. Do not add extra words.
-
-9. Do not add explanations outside the required JSON structure.
+For each word:
+- ipa: Give standard General American IPA between /slashes/.
+- meaningsFa: Give 1 to 4 genuinely common Persian meanings. Prefer everyday meanings, avoid rare senses, avoid duplicates, and do not invent extra meanings just to reach a number.
+- exampleEn: Give one short, natural English example sentence that clearly demonstrates the word. Prefer a practical B1-B2 level sentence and keep it concise.
+- Do not translate the example sentence into Persian.
 
 Input words:
 ${JSONArray(words)}
         """.trimIndent()
 
-        val contents =
-            JSONArray().put(
-                JSONObject().put(
-                    "parts",
-                    JSONArray().put(
-                        JSONObject().put(
-                            "text",
-                            prompt
-                        )
-                    )
-                )
-            )
-
-        val generationConfig =
-            JSONObject()
-                .put(
-                    "temperature",
-                    0.2
-                )
-                .put(
-                    "candidateCount",
-                    1
-                )
-                .put(
-                    "maxOutputTokens",
-                    4096
-                )
-                .put(
-                    "responseMimeType",
-                    "application/json"
-                )
-                .put(
-                    "responseJsonSchema",
-                    responseSchema
-                )
-                .put(
-                    "thinkingConfig",
-                    JSONObject()
-                        .put(
-                            "thinkingBudget",
-                            0
-                        )
-                )
+        val responseFormat = JSONObject()
+            .put("type", "text")
+            .put("mime_type", "application/json")
+            .put("schema", responseSchema)
 
         return JSONObject()
+            .put("model", MODEL)
+            .put("store", false)
+            .put("system_instruction", systemInstruction)
+            .put("input", input)
             .put(
-                "contents",
-                contents
+                "generation_config",
+                JSONObject().put("thinking_level", "low")
             )
-            .put(
-                "generationConfig",
-                generationConfig
-            )
+            .put("response_format", responseFormat)
     }
 
     private fun parseResponse(
         responseText: String,
         expectedWords: List<String>
     ): List<EnrichedCard> {
+        val root = JSONObject(responseText)
+        val steps = root.optJSONArray("steps")
+            ?: error("Gemini returned no response steps.")
 
-        val root =
-            JSONObject(responseText)
+        var outputText: String? = null
 
-        val candidates =
-            root.optJSONArray("candidates")
-                ?: error(
-                    "Gemini پاسخی برای این درخواست تولید نکرد."
-                )
+        for (i in steps.length() - 1 downTo 0) {
+            val step = steps.optJSONObject(i) ?: continue
+            if (step.optString("type") != "model_output") continue
 
-        if (candidates.length() == 0) {
-            error(
-                "Gemini پاسخ خالی برگرداند."
-            )
-        }
-
-        val candidate =
-            candidates.getJSONObject(0)
-
-        val content =
-            candidate.optJSONObject("content")
-                ?: error(
-                    "پاسخ Gemini فاقد content است."
-                )
-
-        val parts =
-            content.optJSONArray("parts")
-                ?: error(
-                    "پاسخ Gemini فاقد parts است."
-                )
-
-        var jsonText: String? = null
-
-        for (i in 0 until parts.length()) {
-
-            val part =
-                parts.optJSONObject(i)
-                    ?: continue
-
-            val text =
-                part.optString("text")
+            val content = step.optJSONArray("content") ?: continue
+            val text = buildString {
+                for (j in 0 until content.length()) {
+                    val block = content.optJSONObject(j) ?: continue
+                    if (block.optString("type") == "text") {
+                        append(block.optString("text"))
+                    }
+                }
+            }.trim()
 
             if (text.isNotBlank()) {
-                jsonText = text
+                outputText = text
                 break
             }
         }
 
-        val outputText =
-            jsonText
-                ?: error(
-                    "Gemini متن قابل پردازشی برنگرداند."
-                )
+        val jsonText = outputText
+            ?: error("Gemini returned no usable text output.")
 
-        val parsed =
-            JSONObject(outputText)
-
-        val cards =
-            parsed.optJSONArray("cards")
-                ?: error(
-                    "Gemini لیست cards را برنگرداند."
-                )
+        val parsed = JSONObject(jsonText)
+        val cards = parsed.optJSONArray("cards")
+            ?: error("Gemini response did not contain cards.")
 
         if (cards.length() != expectedWords.size) {
             error(
-                "Gemini ${cards.length()} کارت برای " +
-                    "${expectedWords.size} کلمه تولید کرد."
+                "Gemini returned ${cards.length()} cards for ${expectedWords.size} words."
             )
         }
 
         return buildList {
-
             for (i in 0 until cards.length()) {
+                val item = cards.getJSONObject(i)
+                val meaningsJson = item.optJSONArray("meaningsFa")
+                    ?: error("Gemini returned a card without meanings.")
 
-                val item =
-                    cards.getJSONObject(i)
+                val meanings = buildList {
+                    for (j in 0 until meaningsJson.length()) {
+                        val meaning = meaningsJson.optString(j).trim()
+                        if (meaning.isNotBlank() && meaning !in this) add(meaning)
+                    }
+                }.take(4)
+
+                if (meanings.isEmpty()) {
+                    error("Gemini returned an empty meanings list.")
+                }
+
+                val ipa = item.optString("ipa").trim()
+                val exampleEn = item.optString("exampleEn").trim()
+
+                if (ipa.isBlank() || exampleEn.isBlank()) {
+                    error("Gemini returned an incomplete flashcard.")
+                }
 
                 add(
                     EnrichedCard(
-                        word =
-                            expectedWords[i],
-
-                        ipa =
-                            item.optString("ipa")
-                                .trim(),
-
-                        translationFa =
-                            item.optString(
-                                "translationFa"
-                            ).trim(),
-
-                        exampleEn =
-                            item.optString(
-                                "exampleEn"
-                            ).trim(),
-
-                        exampleFa =
-                            item.optString(
-                                "exampleFa"
-                            ).trim()
+                        word = expectedWords[i],
+                        ipa = ipa,
+                        meaningsFa = meanings,
+                        exampleEn = exampleEn
                     )
                 )
             }
