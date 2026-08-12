@@ -47,15 +47,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val now = System.currentTimeMillis()
                 val due = cards.asSequence()
                     .filter { it.enrichmentStatus == "READY" && it.nextReviewAt <= now }
-                    .sortedWith(compareBy<FlashcardEntity> { it.nextReviewAt }.thenByDescending { it.lapseCount }.thenBy { it.createdAt })
+                    .sortedWith(
+                        compareBy<FlashcardEntity> { it.nextReviewAt }
+                            .thenByDescending { it.lapseCount }
+                            .thenBy { it.createdAt }
+                    )
                     .toList()
+
                 _dueCount.value = due.size
                 _dueCards.value = due.take(50)
             }
         }
     }
 
-    fun clearMessage() { _message.value = null }
+    fun clearMessage() {
+        _message.value = null
+    }
 
     fun refreshDue() {
         viewModelScope.launch {
@@ -67,8 +74,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveGeminiApiKey(raw: String) {
         val key = raw.trim()
+
         if (key.isBlank()) {
-            _message.value = "کلید API نمی‌تواند خالی باشد."
+            _message.value = "API key cannot be empty."
             return
         }
 
@@ -76,36 +84,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             GeminiApiKeyStore.save(getApplication(), key)
         }.onSuccess {
             _apiKeyConfigured.value = true
-            _message.value = "کلید Google Gemini روی این دستگاه ذخیره شد."
+            _message.value = "Google Gemini API key was saved securely on this device."
             viewModelScope.launch {
                 dao.retryAllFailed()
                 EnrichmentScheduler.enqueue(getApplication())
             }
         }.onFailure {
-            _message.value = "ذخیره کلید ناموفق بود: ${it.message ?: "خطای نامشخص"}"
+            _message.value = "Could not save the API key: ${it.message ?: "Unknown error"}"
         }
     }
 
     fun clearGeminiApiKey() {
         GeminiApiKeyStore.clear(getApplication())
         _apiKeyConfigured.value = false
-        _message.value = "کلید Google Gemini از این دستگاه حذف شد."
+        _message.value = "Google Gemini API key was removed from this device."
     }
 
     fun addWord(raw: String) {
         val word = raw.trim()
         if (word.isBlank()) return
+
         viewModelScope.launch {
             val inserted = dao.insert(newCard(word))
+
             if (inserted > 0) {
                 if (GeminiApiKeyStore.hasKey(getApplication())) {
-                    _message.value = "«$word» اضافه شد و در حال تکمیل با Gemini است."
+                    _message.value = "\"$word\" was added. Gemini is creating the flashcard."
                     EnrichmentScheduler.enqueue(getApplication())
                 } else {
-                    _message.value = "«$word» اضافه شد. برای ساخت خودکار کارت، کلید Gemini را در تنظیمات ذخیره کنید."
+                    _message.value = "\"$word\" was added. Add your Gemini API key in Settings to complete it."
                 }
             } else {
-                _message.value = "این کلمه قبلاً در مجموعه وجود دارد."
+                _message.value = "This word is already in your library."
             }
         }
     }
@@ -119,19 +129,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             if (words.isEmpty()) {
-                _message.value = "کلمه‌ای در فایل CSV پیدا نشد."
+                _message.value = "No words were found in the CSV file."
                 return@launch
             }
 
             val ids = dao.insertAll(words.map(::newCard))
             val added = ids.count { it > 0 }
+
             if (added > 0 && GeminiApiKeyStore.hasKey(getApplication())) {
-                _message.value = "$added کلمه جدید از CSV اضافه شد و در حال تکمیل با Gemini است."
+                _message.value = "$added new words were imported. Gemini is creating the flashcards."
                 EnrichmentScheduler.enqueue(getApplication())
             } else if (added > 0) {
-                _message.value = "$added کلمه اضافه شد. برای تکمیل خودکار، کلید Gemini را در تنظیمات ذخیره کنید."
+                _message.value = "$added words were imported. Add your Gemini API key in Settings to complete them."
             } else {
-                _message.value = "کلمه جدیدی برای اضافه‌کردن پیدا نشد."
+                _message.value = "No new words were found to add."
             }
         }
     }
@@ -145,11 +156,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun retryFailed(card: FlashcardEntity) {
         viewModelScope.launch {
-            dao.update(card.copy(enrichmentStatus = "PENDING", enrichmentError = null))
+            dao.update(
+                card.copy(
+                    enrichmentStatus = "PENDING",
+                    enrichmentError = null
+                )
+            )
+
             if (GeminiApiKeyStore.hasKey(getApplication())) {
                 EnrichmentScheduler.enqueue(getApplication())
             } else {
-                _message.value = "ابتدا کلید Gemini را در تنظیمات ذخیره کنید."
+                _message.value = "Add your Gemini API key in Settings first."
             }
         }
     }
